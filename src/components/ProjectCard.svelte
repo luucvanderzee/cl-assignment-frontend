@@ -1,8 +1,21 @@
 <script>
+  import { fade } from 'svelte/transition'
+  import { createEventDispatcher } from 'svelte'
+
   import User from '../icons/User.svelte'
   import Idea from '../icons/Idea.svelte'
 
   export let project
+  export let showCheckbox
+
+  const dispatch = createEventDispatcher()
+
+  let checked
+  $: { check(checked) }
+
+  function check (value) {
+    dispatch('check', value)
+  }
 </script>
 
 <div class="bg-white rounded-lg shadow-lg overflow-hidden grid grid-cols-2">
@@ -14,7 +27,13 @@
   </div>
   
   <div class="px-6 py-4 space-y-2">
-    <h3 class="text-blue-800 text-lg font-bold">{project.title}</h3>
+    <div class="flex flex-row justify-between">
+      <h3 class="text-blue-800 text-lg font-bold">{project.title}</h3>
+      
+      {#if showCheckbox}
+        <input type="checkbox" bind:checked={checked} transition:fade />
+      {/if}
+    </div>
 
     <div class="text-gray-800">
       {project.description}

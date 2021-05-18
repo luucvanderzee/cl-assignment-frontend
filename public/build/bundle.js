@@ -4,6 +4,7 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    const identity = x => x;
     function add_location(element, file, line, column, char) {
         element.__svelte_meta = {
             loc: { file, line, column, char }
@@ -41,6 +42,41 @@ var app = (function () {
     }
     function component_subscribe(component, store, callback) {
         component.$$.on_destroy.push(subscribe(store, callback));
+    }
+
+    const is_client = typeof window !== 'undefined';
+    let now = is_client
+        ? () => window.performance.now()
+        : () => Date.now();
+    let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+    const tasks = new Set();
+    function run_tasks(now) {
+        tasks.forEach(task => {
+            if (!task.c(now)) {
+                tasks.delete(task);
+                task.f();
+            }
+        });
+        if (tasks.size !== 0)
+            raf(run_tasks);
+    }
+    /**
+     * Creates a new task that runs on each raf frame
+     * until it returns a falsy value or is aborted
+     */
+    function loop(callback) {
+        let task;
+        if (tasks.size === 0)
+            raf(run_tasks);
+        return {
+            promise: new Promise(fulfill => {
+                tasks.add(task = { c: callback, f: fulfill });
+            }),
+            abort() {
+                tasks.delete(task);
+            }
+        };
     }
 
     function append(target, node) {
@@ -90,6 +126,67 @@ var app = (function () {
         const e = document.createEvent('CustomEvent');
         e.initCustomEvent(type, false, false, detail);
         return e;
+    }
+
+    const active_docs = new Set();
+    let active = 0;
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function hash(str) {
+        let hash = 5381;
+        let i = str.length;
+        while (i--)
+            hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+        return hash >>> 0;
+    }
+    function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+        const step = 16.666 / duration;
+        let keyframes = '{\n';
+        for (let p = 0; p <= 1; p += step) {
+            const t = a + (b - a) * ease(p);
+            keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+        }
+        const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+        const name = `__svelte_${hash(rule)}_${uid}`;
+        const doc = node.ownerDocument;
+        active_docs.add(doc);
+        const stylesheet = doc.__svelte_stylesheet || (doc.__svelte_stylesheet = doc.head.appendChild(element('style')).sheet);
+        const current_rules = doc.__svelte_rules || (doc.__svelte_rules = {});
+        if (!current_rules[name]) {
+            current_rules[name] = true;
+            stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+        }
+        const animation = node.style.animation || '';
+        node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
+        active += 1;
+        return name;
+    }
+    function delete_rule(node, name) {
+        const previous = (node.style.animation || '').split(', ');
+        const next = previous.filter(name
+            ? anim => anim.indexOf(name) < 0 // remove specific animation
+            : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+        );
+        const deleted = previous.length - next.length;
+        if (deleted) {
+            node.style.animation = next.join(', ');
+            active -= deleted;
+            if (!active)
+                clear_rules();
+        }
+    }
+    function clear_rules() {
+        raf(() => {
+            if (active)
+                return;
+            active_docs.forEach(doc => {
+                const stylesheet = doc.__svelte_stylesheet;
+                let i = stylesheet.cssRules.length;
+                while (i--)
+                    stylesheet.deleteRule(i);
+                doc.__svelte_rules = {};
+            });
+            active_docs.clear();
+        });
     }
 
     let current_component;
@@ -182,6 +279,20 @@ var app = (function () {
             $$.after_update.forEach(add_render_callback);
         }
     }
+
+    let promise;
+    function wait() {
+        if (!promise) {
+            promise = Promise.resolve();
+            promise.then(() => {
+                promise = null;
+            });
+        }
+        return promise;
+    }
+    function dispatch(node, direction, kind) {
+        node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+    }
     const outroing = new Set();
     let outros;
     function group_outros() {
@@ -219,6 +330,118 @@ var app = (function () {
             block.o(local);
         }
     }
+    const null_transition = { duration: 0 };
+    function create_bidirectional_transition(node, fn, params, intro) {
+        let config = fn(node, params);
+        let t = intro ? 0 : 1;
+        let running_program = null;
+        let pending_program = null;
+        let animation_name = null;
+        function clear_animation() {
+            if (animation_name)
+                delete_rule(node, animation_name);
+        }
+        function init(program, duration) {
+            const d = program.b - t;
+            duration *= Math.abs(d);
+            return {
+                a: t,
+                b: program.b,
+                d,
+                duration,
+                start: program.start,
+                end: program.start + duration,
+                group: program.group
+            };
+        }
+        function go(b) {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            const program = {
+                start: now() + delay,
+                b
+            };
+            if (!b) {
+                // @ts-ignore todo: improve typings
+                program.group = outros;
+                outros.r += 1;
+            }
+            if (running_program || pending_program) {
+                pending_program = program;
+            }
+            else {
+                // if this is an intro, and there's a delay, we need to do
+                // an initial tick and/or apply CSS animation immediately
+                if (css) {
+                    clear_animation();
+                    animation_name = create_rule(node, t, b, duration, delay, easing, css);
+                }
+                if (b)
+                    tick(0, 1);
+                running_program = init(program, duration);
+                add_render_callback(() => dispatch(node, b, 'start'));
+                loop(now => {
+                    if (pending_program && now > pending_program.start) {
+                        running_program = init(pending_program, duration);
+                        pending_program = null;
+                        dispatch(node, running_program.b, 'start');
+                        if (css) {
+                            clear_animation();
+                            animation_name = create_rule(node, t, running_program.b, running_program.duration, 0, easing, config.css);
+                        }
+                    }
+                    if (running_program) {
+                        if (now >= running_program.end) {
+                            tick(t = running_program.b, 1 - t);
+                            dispatch(node, running_program.b, 'end');
+                            if (!pending_program) {
+                                // we're done
+                                if (running_program.b) {
+                                    // intro — we can tidy up immediately
+                                    clear_animation();
+                                }
+                                else {
+                                    // outro — needs to be coordinated
+                                    if (!--running_program.group.r)
+                                        run_all(running_program.group.c);
+                                }
+                            }
+                            running_program = null;
+                        }
+                        else if (now >= running_program.start) {
+                            const p = now - running_program.start;
+                            t = running_program.a + running_program.d * easing(p / running_program.duration);
+                            tick(t, 1 - t);
+                        }
+                    }
+                    return !!(running_program || pending_program);
+                });
+            }
+        }
+        return {
+            run(b) {
+                if (is_function(config)) {
+                    wait().then(() => {
+                        // @ts-ignore
+                        config = config();
+                        go(b);
+                    });
+                }
+                else {
+                    go(b);
+                }
+            },
+            end() {
+                clear_animation();
+                running_program = pending_program = null;
+            }
+        };
+    }
+
+    const globals = (typeof window !== 'undefined'
+        ? window
+        : typeof globalThis !== 'undefined'
+            ? globalThis
+            : global);
     function create_component(block) {
         block && block.c();
     }
@@ -1172,11 +1395,13 @@ var app = (function () {
 
     			attr_dev(button, "class", button_class_value = `
     ${/*disabled*/ ctx[0] ? "cursor-not-allowed" : ""}
-    ${/*disabled*/ ctx[0] ? "bg-green-500" : "bg-green-700"}
-    rounded-xl px-3 py-2 text-white font-bold hover:bg-green-500
+    ${/*disabled*/ ctx[0]
+			? "bg-green-300"
+			: "bg-green-700 hover:bg-green-500"}
+    rounded-xl px-3 py-2 text-white font-bold
   `);
 
-    			add_location(button, file$6, 12, 0, 200);
+    			add_location(button, file$6, 12, 0, 193);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -1193,8 +1418,10 @@ var app = (function () {
     		p: function update(ctx, [dirty]) {
     			if (dirty & /*disabled*/ 1 && button_class_value !== (button_class_value = `
     ${/*disabled*/ ctx[0] ? "cursor-not-allowed" : ""}
-    ${/*disabled*/ ctx[0] ? "bg-green-500" : "bg-green-700"}
-    rounded-xl px-3 py-2 text-white font-bold hover:bg-green-500
+    ${/*disabled*/ ctx[0]
+			? "bg-green-300"
+			: "bg-green-700 hover:bg-green-500"}
+    rounded-xl px-3 py-2 text-white font-bold
   `)) {
     				attr_dev(button, "class", button_class_value);
     			}
@@ -1222,7 +1449,7 @@ var app = (function () {
     function instance$6($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("ConfirmSubscriptionButton", slots, []);
-    	let { disabled = true } = $$props;
+    	let { disabled } = $$props;
     	const dispatch = createEventDispatcher();
 
     	function click() {
@@ -1268,6 +1495,13 @@ var app = (function () {
     			options,
     			id: create_fragment$6.name
     		});
+
+    		const { ctx } = this.$$;
+    		const props = options.props || {};
+
+    		if (/*disabled*/ ctx[0] === undefined && !("disabled" in props)) {
+    			console.warn("<ConfirmSubscriptionButton> was created without expected prop 'disabled'");
+    		}
     	}
 
     	get disabled() {
@@ -1277,6 +1511,16 @@ var app = (function () {
     	set disabled(value) {
     		throw new Error("<ConfirmSubscriptionButton>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
     	}
+    }
+
+    function fade(node, { delay = 0, duration = 400, easing = identity } = {}) {
+        const o = +getComputedStyle(node).opacity;
+        return {
+            delay,
+            duration,
+            easing,
+            css: t => `opacity: ${t * o}`
+        };
     }
 
     /* src/icons/User.svelte generated by Svelte v3.38.2 */
@@ -1434,139 +1678,213 @@ var app = (function () {
     /* src/components/ProjectCard.svelte generated by Svelte v3.38.2 */
     const file$3 = "src/components/ProjectCard.svelte";
 
+    // (33:6) {#if showCheckbox}
+    function create_if_block$1(ctx) {
+    	let input;
+    	let input_transition;
+    	let current;
+    	let mounted;
+    	let dispose;
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "checkbox");
+    			add_location(input, file$3, 33, 8, 774);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+    			input.checked = /*checked*/ ctx[2];
+    			current = true;
+
+    			if (!mounted) {
+    				dispose = listen_dev(input, "change", /*input_change_handler*/ ctx[3]);
+    				mounted = true;
+    			}
+    		},
+    		p: function update(ctx, dirty) {
+    			if (dirty & /*checked*/ 4) {
+    				input.checked = /*checked*/ ctx[2];
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+
+    			add_render_callback(() => {
+    				if (!input_transition) input_transition = create_bidirectional_transition(input, fade, {}, true);
+    				input_transition.run(1);
+    			});
+
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			if (!input_transition) input_transition = create_bidirectional_transition(input, fade, {}, false);
+    			input_transition.run(0);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(input);
+    			if (detaching && input_transition) input_transition.end();
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block$1.name,
+    		type: "if",
+    		source: "(33:6) {#if showCheckbox}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
     function create_fragment$3(ctx) {
-    	let div9;
+    	let div10;
     	let div0;
     	let img;
     	let img_src_value;
     	let img_alt_value;
     	let t0;
-    	let div8;
+    	let div9;
+    	let div1;
     	let h3;
     	let t1_value = /*project*/ ctx[0].title + "";
     	let t1;
     	let t2;
-    	let div1;
-    	let t3_value = /*project*/ ctx[0].description + "";
     	let t3;
-    	let t4;
-    	let div4;
     	let div2;
-    	let t6;
-    	let div3;
-    	let t7_value = /*project*/ ctx[0].startAt + "";
-    	let t7;
-    	let t8;
-    	let t9_value = /*project*/ ctx[0].endAt + "";
-    	let t9;
-    	let t10;
-    	let div7;
+    	let t4_value = /*project*/ ctx[0].description + "";
+    	let t4;
+    	let t5;
     	let div5;
-    	let user;
+    	let div3;
+    	let t7;
+    	let div4;
+    	let t8_value = /*project*/ ctx[0].startAt + "";
+    	let t8;
+    	let t9;
+    	let t10_value = /*project*/ ctx[0].endAt + "";
+    	let t10;
     	let t11;
-    	let t12_value = /*project*/ ctx[0].users + "";
-    	let t12;
-    	let t13;
+    	let div8;
     	let div6;
-    	let idea;
+    	let user;
+    	let t12;
+    	let t13_value = /*project*/ ctx[0].users + "";
+    	let t13;
     	let t14;
-    	let t15_value = /*project*/ ctx[0].ideas + "";
+    	let div7;
+    	let idea;
     	let t15;
+    	let t16_value = /*project*/ ctx[0].ideas + "";
+    	let t16;
     	let current;
+    	let if_block = /*showCheckbox*/ ctx[1] && create_if_block$1(ctx);
     	user = new User({ $$inline: true });
     	idea = new Idea({ $$inline: true });
 
     	const block = {
     		c: function create() {
-    			div9 = element("div");
+    			div10 = element("div");
     			div0 = element("div");
     			img = element("img");
     			t0 = space();
-    			div8 = element("div");
+    			div9 = element("div");
+    			div1 = element("div");
     			h3 = element("h3");
     			t1 = text(t1_value);
     			t2 = space();
-    			div1 = element("div");
-    			t3 = text(t3_value);
-    			t4 = space();
-    			div4 = element("div");
+    			if (if_block) if_block.c();
+    			t3 = space();
     			div2 = element("div");
-    			div2.textContent = "Period:";
-    			t6 = space();
-    			div3 = element("div");
-    			t7 = text(t7_value);
-    			t8 = text(" - ");
-    			t9 = text(t9_value);
-    			t10 = space();
-    			div7 = element("div");
+    			t4 = text(t4_value);
+    			t5 = space();
     			div5 = element("div");
-    			create_component(user.$$.fragment);
+    			div3 = element("div");
+    			div3.textContent = "Period:";
+    			t7 = space();
+    			div4 = element("div");
+    			t8 = text(t8_value);
+    			t9 = text(" - ");
+    			t10 = text(t10_value);
     			t11 = space();
-    			t12 = text(t12_value);
-    			t13 = space();
+    			div8 = element("div");
     			div6 = element("div");
-    			create_component(idea.$$.fragment);
+    			create_component(user.$$.fragment);
+    			t12 = space();
+    			t13 = text(t13_value);
     			t14 = space();
-    			t15 = text(t15_value);
+    			div7 = element("div");
+    			create_component(idea.$$.fragment);
+    			t15 = space();
+    			t16 = text(t16_value);
     			if (img.src !== (img_src_value = `img/${/*project*/ ctx[0].img}`)) attr_dev(img, "src", img_src_value);
     			attr_dev(img, "alt", img_alt_value = /*project*/ ctx[0].img);
-    			add_location(img, file$3, 9, 4, 234);
+    			add_location(img, file$3, 22, 4, 497);
     			attr_dev(div0, "class", "flex w-1/1");
-    			add_location(div0, file$3, 8, 2, 205);
+    			add_location(div0, file$3, 21, 2, 468);
     			attr_dev(h3, "class", "text-blue-800 text-lg font-bold");
-    			add_location(h3, file$3, 16, 4, 356);
-    			attr_dev(div1, "class", "text-gray-800");
-    			add_location(div1, file$3, 18, 4, 426);
-    			attr_dev(div2, "class", "text-gray-800 font-bold text-sm");
-    			add_location(div2, file$3, 23, 6, 567);
-    			attr_dev(div3, "class", "text-gray-700 text-sm");
-    			add_location(div3, file$3, 24, 6, 632);
-    			attr_dev(div4, "class", "flex flex-row justify-between border rounded p-2");
-    			add_location(div4, file$3, 22, 4, 498);
-    			attr_dev(div5, "class", "");
-    			add_location(div5, file$3, 28, 6, 755);
+    			add_location(h3, file$3, 30, 6, 669);
+    			attr_dev(div1, "class", "flex flex-row justify-between");
+    			add_location(div1, file$3, 29, 4, 619);
+    			attr_dev(div2, "class", "text-gray-800");
+    			add_location(div2, file$3, 37, 4, 867);
+    			attr_dev(div3, "class", "text-gray-800 font-bold text-sm");
+    			add_location(div3, file$3, 42, 6, 1008);
+    			attr_dev(div4, "class", "text-gray-700 text-sm");
+    			add_location(div4, file$3, 43, 6, 1073);
+    			attr_dev(div5, "class", "flex flex-row justify-between border rounded p-2");
+    			add_location(div5, file$3, 41, 4, 939);
     			attr_dev(div6, "class", "");
-    			add_location(div6, file$3, 32, 6, 830);
-    			attr_dev(div7, "class", "space-y-2");
-    			add_location(div7, file$3, 27, 4, 725);
-    			attr_dev(div8, "class", "px-6 py-4 space-y-2");
-    			add_location(div8, file$3, 15, 2, 318);
-    			attr_dev(div9, "class", "bg-white rounded-lg shadow-lg overflow-hidden grid grid-cols-2");
-    			add_location(div9, file$3, 7, 0, 126);
+    			add_location(div6, file$3, 47, 6, 1196);
+    			attr_dev(div7, "class", "");
+    			add_location(div7, file$3, 51, 6, 1271);
+    			attr_dev(div8, "class", "space-y-2");
+    			add_location(div8, file$3, 46, 4, 1166);
+    			attr_dev(div9, "class", "px-6 py-4 space-y-2");
+    			add_location(div9, file$3, 28, 2, 581);
+    			attr_dev(div10, "class", "bg-white rounded-lg shadow-lg overflow-hidden grid grid-cols-2");
+    			add_location(div10, file$3, 20, 0, 389);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div9, anchor);
-    			append_dev(div9, div0);
+    			insert_dev(target, div10, anchor);
+    			append_dev(div10, div0);
     			append_dev(div0, img);
-    			append_dev(div9, t0);
-    			append_dev(div9, div8);
-    			append_dev(div8, h3);
+    			append_dev(div10, t0);
+    			append_dev(div10, div9);
+    			append_dev(div9, div1);
+    			append_dev(div1, h3);
     			append_dev(h3, t1);
-    			append_dev(div8, t2);
-    			append_dev(div8, div1);
-    			append_dev(div1, t3);
-    			append_dev(div8, t4);
-    			append_dev(div8, div4);
-    			append_dev(div4, div2);
-    			append_dev(div4, t6);
-    			append_dev(div4, div3);
-    			append_dev(div3, t7);
-    			append_dev(div3, t8);
-    			append_dev(div3, t9);
-    			append_dev(div8, t10);
+    			append_dev(div1, t2);
+    			if (if_block) if_block.m(div1, null);
+    			append_dev(div9, t3);
+    			append_dev(div9, div2);
+    			append_dev(div2, t4);
+    			append_dev(div9, t5);
+    			append_dev(div9, div5);
+    			append_dev(div5, div3);
+    			append_dev(div5, t7);
+    			append_dev(div5, div4);
+    			append_dev(div4, t8);
+    			append_dev(div4, t9);
+    			append_dev(div4, t10);
+    			append_dev(div9, t11);
+    			append_dev(div9, div8);
+    			append_dev(div8, div6);
+    			mount_component(user, div6, null);
+    			append_dev(div6, t12);
+    			append_dev(div6, t13);
+    			append_dev(div8, t14);
     			append_dev(div8, div7);
-    			append_dev(div7, div5);
-    			mount_component(user, div5, null);
-    			append_dev(div5, t11);
-    			append_dev(div5, t12);
-    			append_dev(div7, t13);
-    			append_dev(div7, div6);
-    			mount_component(idea, div6, null);
-    			append_dev(div6, t14);
-    			append_dev(div6, t15);
+    			mount_component(idea, div7, null);
+    			append_dev(div7, t15);
+    			append_dev(div7, t16);
     			current = true;
     		},
     		p: function update(ctx, [dirty]) {
@@ -1579,25 +1897,52 @@ var app = (function () {
     			}
 
     			if ((!current || dirty & /*project*/ 1) && t1_value !== (t1_value = /*project*/ ctx[0].title + "")) set_data_dev(t1, t1_value);
-    			if ((!current || dirty & /*project*/ 1) && t3_value !== (t3_value = /*project*/ ctx[0].description + "")) set_data_dev(t3, t3_value);
-    			if ((!current || dirty & /*project*/ 1) && t7_value !== (t7_value = /*project*/ ctx[0].startAt + "")) set_data_dev(t7, t7_value);
-    			if ((!current || dirty & /*project*/ 1) && t9_value !== (t9_value = /*project*/ ctx[0].endAt + "")) set_data_dev(t9, t9_value);
-    			if ((!current || dirty & /*project*/ 1) && t12_value !== (t12_value = /*project*/ ctx[0].users + "")) set_data_dev(t12, t12_value);
-    			if ((!current || dirty & /*project*/ 1) && t15_value !== (t15_value = /*project*/ ctx[0].ideas + "")) set_data_dev(t15, t15_value);
+
+    			if (/*showCheckbox*/ ctx[1]) {
+    				if (if_block) {
+    					if_block.p(ctx, dirty);
+
+    					if (dirty & /*showCheckbox*/ 2) {
+    						transition_in(if_block, 1);
+    					}
+    				} else {
+    					if_block = create_if_block$1(ctx);
+    					if_block.c();
+    					transition_in(if_block, 1);
+    					if_block.m(div1, null);
+    				}
+    			} else if (if_block) {
+    				group_outros();
+
+    				transition_out(if_block, 1, 1, () => {
+    					if_block = null;
+    				});
+
+    				check_outros();
+    			}
+
+    			if ((!current || dirty & /*project*/ 1) && t4_value !== (t4_value = /*project*/ ctx[0].description + "")) set_data_dev(t4, t4_value);
+    			if ((!current || dirty & /*project*/ 1) && t8_value !== (t8_value = /*project*/ ctx[0].startAt + "")) set_data_dev(t8, t8_value);
+    			if ((!current || dirty & /*project*/ 1) && t10_value !== (t10_value = /*project*/ ctx[0].endAt + "")) set_data_dev(t10, t10_value);
+    			if ((!current || dirty & /*project*/ 1) && t13_value !== (t13_value = /*project*/ ctx[0].users + "")) set_data_dev(t13, t13_value);
+    			if ((!current || dirty & /*project*/ 1) && t16_value !== (t16_value = /*project*/ ctx[0].ideas + "")) set_data_dev(t16, t16_value);
     		},
     		i: function intro(local) {
     			if (current) return;
+    			transition_in(if_block);
     			transition_in(user.$$.fragment, local);
     			transition_in(idea.$$.fragment, local);
     			current = true;
     		},
     		o: function outro(local) {
+    			transition_out(if_block);
     			transition_out(user.$$.fragment, local);
     			transition_out(idea.$$.fragment, local);
     			current = false;
     		},
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div9);
+    			if (detaching) detach_dev(div10);
+    			if (if_block) if_block.d();
     			destroy_component(user);
     			destroy_component(idea);
     		}
@@ -1618,33 +1963,67 @@ var app = (function () {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("ProjectCard", slots, []);
     	let { project } = $$props;
-    	const writable_props = ["project"];
+    	let { showCheckbox } = $$props;
+    	const dispatch = createEventDispatcher();
+    	let checked;
+
+    	function check(value) {
+    		dispatch("check", value);
+    	}
+
+    	const writable_props = ["project", "showCheckbox"];
 
     	Object.keys($$props).forEach(key => {
     		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<ProjectCard> was created with unknown prop '${key}'`);
     	});
 
+    	function input_change_handler() {
+    		checked = this.checked;
+    		$$invalidate(2, checked);
+    	}
+
     	$$self.$$set = $$props => {
     		if ("project" in $$props) $$invalidate(0, project = $$props.project);
+    		if ("showCheckbox" in $$props) $$invalidate(1, showCheckbox = $$props.showCheckbox);
     	};
 
-    	$$self.$capture_state = () => ({ User, Idea, project });
+    	$$self.$capture_state = () => ({
+    		fade,
+    		createEventDispatcher,
+    		User,
+    		Idea,
+    		project,
+    		showCheckbox,
+    		dispatch,
+    		checked,
+    		check
+    	});
 
     	$$self.$inject_state = $$props => {
     		if ("project" in $$props) $$invalidate(0, project = $$props.project);
+    		if ("showCheckbox" in $$props) $$invalidate(1, showCheckbox = $$props.showCheckbox);
+    		if ("checked" in $$props) $$invalidate(2, checked = $$props.checked);
     	};
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
     	}
 
-    	return [project];
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*checked*/ 4) {
+    			{
+    				check(checked);
+    			}
+    		}
+    	};
+
+    	return [project, showCheckbox, checked, input_change_handler];
     }
 
     class ProjectCard extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, { project: 0 });
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, { project: 0, showCheckbox: 1 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
@@ -1659,6 +2038,10 @@ var app = (function () {
     		if (/*project*/ ctx[0] === undefined && !("project" in props)) {
     			console.warn("<ProjectCard> was created without expected prop 'project'");
     		}
+
+    		if (/*showCheckbox*/ ctx[1] === undefined && !("showCheckbox" in props)) {
+    			console.warn("<ProjectCard> was created without expected prop 'showCheckbox'");
+    		}
     	}
 
     	get project() {
@@ -1668,18 +2051,28 @@ var app = (function () {
     	set project(value) {
     		throw new Error("<ProjectCard>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
     	}
+
+    	get showCheckbox() {
+    		throw new Error("<ProjectCard>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set showCheckbox(value) {
+    		throw new Error("<ProjectCard>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
     }
 
     /* src/panels/Projects.svelte generated by Svelte v3.38.2 */
+
+    const { Object: Object_1 } = globals;
     const file$2 = "src/panels/Projects.svelte";
 
     function get_each_context(ctx, list, i) {
     	const child_ctx = ctx.slice();
-    	child_ctx[5] = list[i];
+    	child_ctx[9] = list[i];
     	return child_ctx;
     }
 
-    // (17:0) {#if mounted}
+    // (29:0) {#if mounted}
     function create_if_block(ctx) {
     	let div2;
     	let div0;
@@ -1689,9 +2082,9 @@ var app = (function () {
     	let t3;
     	let div1;
     	let current;
-    	let if_block0 = !/*subscribeOn*/ ctx[1] && create_if_block_2(ctx);
-    	let if_block1 = /*subscribeOn*/ ctx[1] && create_if_block_1(ctx);
-    	let each_value = /*$projects*/ ctx[2];
+    	let if_block0 = !/*subscribeDone*/ ctx[2] && create_if_block_2(ctx);
+    	let if_block1 = /*subscribeDone*/ ctx[2] && create_if_block_1(ctx);
+    	let each_value = /*$projects*/ ctx[4];
     	validate_each_argument(each_value);
     	let each_blocks = [];
 
@@ -1721,13 +2114,13 @@ var app = (function () {
     			}
 
     			attr_dev(h1, "class", "text-xl font-bold text-gray-800");
-    			add_location(h1, file$2, 21, 6, 601);
+    			add_location(h1, file$2, 33, 6, 806);
     			attr_dev(div0, "class", "flex flex-row justify-between items-center p-3 pb-7");
-    			add_location(div0, file$2, 20, 4, 529);
+    			add_location(div0, file$2, 32, 4, 734);
     			attr_dev(div1, "class", "grid grid-flow-row grid-cols-2 gap-4");
-    			add_location(div1, file$2, 32, 4, 897);
+    			add_location(div1, file$2, 53, 4, 1312);
     			attr_dev(div2, "class", "max-w-7xl mx-auto px-2 py-8");
-    			add_location(div2, file$2, 18, 2, 480);
+    			add_location(div2, file$2, 30, 2, 685);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div2, anchor);
@@ -1747,11 +2140,11 @@ var app = (function () {
     			current = true;
     		},
     		p: function update(ctx, dirty) {
-    			if (!/*subscribeOn*/ ctx[1]) {
+    			if (!/*subscribeDone*/ ctx[2]) {
     				if (if_block0) {
     					if_block0.p(ctx, dirty);
 
-    					if (dirty & /*subscribeOn*/ 2) {
+    					if (dirty & /*subscribeDone*/ 4) {
     						transition_in(if_block0, 1);
     					}
     				} else {
@@ -1770,31 +2163,19 @@ var app = (function () {
     				check_outros();
     			}
 
-    			if (/*subscribeOn*/ ctx[1]) {
-    				if (if_block1) {
-    					if_block1.p(ctx, dirty);
-
-    					if (dirty & /*subscribeOn*/ 2) {
-    						transition_in(if_block1, 1);
-    					}
-    				} else {
+    			if (/*subscribeDone*/ ctx[2]) {
+    				if (if_block1) ; else {
     					if_block1 = create_if_block_1(ctx);
     					if_block1.c();
-    					transition_in(if_block1, 1);
     					if_block1.m(div0, null);
     				}
     			} else if (if_block1) {
-    				group_outros();
-
-    				transition_out(if_block1, 1, 1, () => {
-    					if_block1 = null;
-    				});
-
-    				check_outros();
+    				if_block1.d(1);
+    				if_block1 = null;
     			}
 
-    			if (dirty & /*$projects, subscribeOn*/ 6) {
-    				each_value = /*$projects*/ ctx[2];
+    			if (dirty & /*$projects, subscribeOn, subscribeDone, handleCheck*/ 54) {
+    				each_value = /*$projects*/ ctx[4];
     				validate_each_argument(each_value);
     				let i;
 
@@ -1824,7 +2205,6 @@ var app = (function () {
     		i: function intro(local) {
     			if (current) return;
     			transition_in(if_block0);
-    			transition_in(if_block1);
 
     			for (let i = 0; i < each_value.length; i += 1) {
     				transition_in(each_blocks[i]);
@@ -1834,7 +2214,6 @@ var app = (function () {
     		},
     		o: function outro(local) {
     			transition_out(if_block0);
-    			transition_out(if_block1);
     			each_blocks = each_blocks.filter(Boolean);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
@@ -1855,19 +2234,118 @@ var app = (function () {
     		block,
     		id: create_if_block.name,
     		type: "if",
-    		source: "(17:0) {#if mounted}",
+    		source: "(29:0) {#if mounted}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (24:6) {#if !subscribeOn}
+    // (36:6) {#if !subscribeDone}
     function create_if_block_2(ctx) {
+    	let t;
+    	let if_block1_anchor;
+    	let current;
+    	let if_block0 = !/*subscribeOn*/ ctx[1] && create_if_block_4(ctx);
+    	let if_block1 = /*subscribeOn*/ ctx[1] && create_if_block_3(ctx);
+
+    	const block = {
+    		c: function create() {
+    			if (if_block0) if_block0.c();
+    			t = space();
+    			if (if_block1) if_block1.c();
+    			if_block1_anchor = empty();
+    		},
+    		m: function mount(target, anchor) {
+    			if (if_block0) if_block0.m(target, anchor);
+    			insert_dev(target, t, anchor);
+    			if (if_block1) if_block1.m(target, anchor);
+    			insert_dev(target, if_block1_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			if (!/*subscribeOn*/ ctx[1]) {
+    				if (if_block0) {
+    					if_block0.p(ctx, dirty);
+
+    					if (dirty & /*subscribeOn*/ 2) {
+    						transition_in(if_block0, 1);
+    					}
+    				} else {
+    					if_block0 = create_if_block_4(ctx);
+    					if_block0.c();
+    					transition_in(if_block0, 1);
+    					if_block0.m(t.parentNode, t);
+    				}
+    			} else if (if_block0) {
+    				group_outros();
+
+    				transition_out(if_block0, 1, 1, () => {
+    					if_block0 = null;
+    				});
+
+    				check_outros();
+    			}
+
+    			if (/*subscribeOn*/ ctx[1]) {
+    				if (if_block1) {
+    					if_block1.p(ctx, dirty);
+
+    					if (dirty & /*subscribeOn*/ 2) {
+    						transition_in(if_block1, 1);
+    					}
+    				} else {
+    					if_block1 = create_if_block_3(ctx);
+    					if_block1.c();
+    					transition_in(if_block1, 1);
+    					if_block1.m(if_block1_anchor.parentNode, if_block1_anchor);
+    				}
+    			} else if (if_block1) {
+    				group_outros();
+
+    				transition_out(if_block1, 1, 1, () => {
+    					if_block1 = null;
+    				});
+
+    				check_outros();
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block0);
+    			transition_in(if_block1);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(if_block0);
+    			transition_out(if_block1);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (if_block0) if_block0.d(detaching);
+    			if (detaching) detach_dev(t);
+    			if (if_block1) if_block1.d(detaching);
+    			if (detaching) detach_dev(if_block1_anchor);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block_2.name,
+    		type: "if",
+    		source: "(36:6) {#if !subscribeDone}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (37:8) {#if !subscribeOn}
+    function create_if_block_4(ctx) {
     	let subscribebutton;
     	let current;
     	subscribebutton = new SubscribeButton({ $$inline: true });
-    	subscribebutton.$on("click", /*click_handler*/ ctx[3]);
+    	subscribebutton.$on("click", /*click_handler*/ ctx[6]);
 
     	const block = {
     		c: function create() {
@@ -1894,21 +2372,28 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_2.name,
+    		id: create_if_block_4.name,
     		type: "if",
-    		source: "(24:6) {#if !subscribeOn}",
+    		source: "(37:8) {#if !subscribeOn}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (28:6) {#if subscribeOn}
-    function create_if_block_1(ctx) {
+    // (41:8) {#if subscribeOn}
+    function create_if_block_3(ctx) {
     	let confirmsubscriptionbutton;
     	let current;
-    	confirmsubscriptionbutton = new ConfirmSubscriptionButton({ $$inline: true });
-    	confirmsubscriptionbutton.$on("click", /*click_handler_1*/ ctx[4]);
+
+    	confirmsubscriptionbutton = new ConfirmSubscriptionButton({
+    			props: {
+    				disabled: Object.keys(/*selectedCards*/ ctx[3]).length === 0
+    			},
+    			$$inline: true
+    		});
+
+    	confirmsubscriptionbutton.$on("click", /*click_handler_1*/ ctx[7]);
 
     	const block = {
     		c: function create() {
@@ -1918,7 +2403,11 @@ var app = (function () {
     			mount_component(confirmsubscriptionbutton, target, anchor);
     			current = true;
     		},
-    		p: noop,
+    		p: function update(ctx, dirty) {
+    			const confirmsubscriptionbutton_changes = {};
+    			if (dirty & /*selectedCards*/ 8) confirmsubscriptionbutton_changes.disabled = Object.keys(/*selectedCards*/ ctx[3]).length === 0;
+    			confirmsubscriptionbutton.$set(confirmsubscriptionbutton_changes);
+    		},
     		i: function intro(local) {
     			if (current) return;
     			transition_in(confirmsubscriptionbutton.$$.fragment, local);
@@ -1935,27 +2424,60 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_if_block_1.name,
+    		id: create_if_block_3.name,
     		type: "if",
-    		source: "(28:6) {#if subscribeOn}",
+    		source: "(41:8) {#if subscribeOn}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (34:6) {#each $projects as project}
+    // (49:6) {#if subscribeDone}
+    function create_if_block_1(ctx) {
+    	let t;
+
+    	const block = {
+    		c: function create() {
+    			t = text("Thanks for subscribing!");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, t, anchor);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(t);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block_1.name,
+    		type: "if",
+    		source: "(49:6) {#if subscribeDone}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (55:6) {#each $projects as project}
     function create_each_block(ctx) {
     	let projectcard;
     	let current;
 
+    	function check_handler(...args) {
+    		return /*check_handler*/ ctx[8](/*project*/ ctx[9], ...args);
+    	}
+
     	projectcard = new ProjectCard({
     			props: {
-    				project: /*project*/ ctx[5],
-    				showCheckbox: /*subscribeOn*/ ctx[1]
+    				project: /*project*/ ctx[9],
+    				showCheckbox: /*subscribeOn*/ ctx[1] && !/*subscribeDone*/ ctx[2]
     			},
     			$$inline: true
     		});
+
+    	projectcard.$on("check", check_handler);
 
     	const block = {
     		c: function create() {
@@ -1965,10 +2487,11 @@ var app = (function () {
     			mount_component(projectcard, target, anchor);
     			current = true;
     		},
-    		p: function update(ctx, dirty) {
+    		p: function update(new_ctx, dirty) {
+    			ctx = new_ctx;
     			const projectcard_changes = {};
-    			if (dirty & /*$projects*/ 4) projectcard_changes.project = /*project*/ ctx[5];
-    			if (dirty & /*subscribeOn*/ 2) projectcard_changes.showCheckbox = /*subscribeOn*/ ctx[1];
+    			if (dirty & /*$projects*/ 16) projectcard_changes.project = /*project*/ ctx[9];
+    			if (dirty & /*subscribeOn, subscribeDone*/ 6) projectcard_changes.showCheckbox = /*subscribeOn*/ ctx[1] && !/*subscribeDone*/ ctx[2];
     			projectcard.$set(projectcard_changes);
     		},
     		i: function intro(local) {
@@ -1989,7 +2512,7 @@ var app = (function () {
     		block,
     		id: create_each_block.name,
     		type: "each",
-    		source: "(34:6) {#each $projects as project}",
+    		source: "(55:6) {#each $projects as project}",
     		ctx
     	});
 
@@ -2067,20 +2590,32 @@ var app = (function () {
     function instance$2($$self, $$props, $$invalidate) {
     	let $projects;
     	validate_store(projects, "projects");
-    	component_subscribe($$self, projects, $$value => $$invalidate(2, $projects = $$value));
+    	component_subscribe($$self, projects, $$value => $$invalidate(4, $projects = $$value));
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Projects", slots, []);
     	let mounted = false;
     	let subscribeOn = false;
+    	let subscribeDone = false;
+    	let selectedCards = {};
 
     	onMount(async () => {
     		await fetchProjects();
     		$$invalidate(0, mounted = true);
     	});
 
+    	function handleCheck(value, id) {
+    		if (value) {
+    			$$invalidate(3, selectedCards[id] = true, selectedCards);
+    		}
+
+    		if (!value) {
+    			delete selectedCards[id];
+    		}
+    	}
+
     	const writable_props = [];
 
-    	Object.keys($$props).forEach(key => {
+    	Object_1.keys($$props).forEach(key => {
     		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Projects> was created with unknown prop '${key}'`);
     	});
 
@@ -2089,7 +2624,11 @@ var app = (function () {
     	};
 
     	const click_handler_1 = () => {
-    		$$invalidate(1, subscribeOn = false);
+    		$$invalidate(2, subscribeDone = true);
+    	};
+
+    	const check_handler = (project, value) => {
+    		handleCheck(value, project.id);
     	};
 
     	$$self.$capture_state = () => ({
@@ -2101,19 +2640,34 @@ var app = (function () {
     		ProjectCard,
     		mounted,
     		subscribeOn,
+    		subscribeDone,
+    		selectedCards,
+    		handleCheck,
     		$projects
     	});
 
     	$$self.$inject_state = $$props => {
     		if ("mounted" in $$props) $$invalidate(0, mounted = $$props.mounted);
     		if ("subscribeOn" in $$props) $$invalidate(1, subscribeOn = $$props.subscribeOn);
+    		if ("subscribeDone" in $$props) $$invalidate(2, subscribeDone = $$props.subscribeDone);
+    		if ("selectedCards" in $$props) $$invalidate(3, selectedCards = $$props.selectedCards);
     	};
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
     	}
 
-    	return [mounted, subscribeOn, $projects, click_handler, click_handler_1];
+    	return [
+    		mounted,
+    		subscribeOn,
+    		subscribeDone,
+    		selectedCards,
+    		$projects,
+    		handleCheck,
+    		click_handler,
+    		click_handler_1,
+    		check_handler
+    	];
     }
 
     class Projects extends SvelteComponentDev {
