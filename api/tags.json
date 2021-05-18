@@ -1,0 +1,62 @@
+[
+  {
+    "label": "health",
+    "score": 0.113938
+  },
+  {
+    "label": "traffic",
+    "score": 0.544215
+  },
+  {
+    "label": "streets",
+    "score": 0.529549
+  },
+  {
+    "label": "infrastructure",
+    "score": 0.833819
+  },
+  {
+    "label": "echinital",
+    "score": 0.425693
+  },
+  {
+    "label": "architecture",
+    "score": 0.366833
+  },
+  {
+    "label": "culture",
+    "score": 0.88699
+  },
+  {
+    "label": "governance",
+    "score": 0.260472
+  },
+  {
+    "label": "elderly",
+    "score": 0.0410126
+  },
+  {
+    "label": "mobile",
+    "score": 0.506603
+  },
+  {
+    "label": "nature",
+    "score": 0.994411
+  },
+  {
+    "label": "community",
+    "score": 0.386739
+  },
+  {
+    "label": "together",
+    "score": 0.518047
+  },
+  {
+    "label": "neighbours",
+    "score": 0.315571
+  },
+  {
+    "label": "green",
+    "score": 0.713613
+  }
+]
