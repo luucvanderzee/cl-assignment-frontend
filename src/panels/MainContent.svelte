@@ -3,7 +3,7 @@
   import Projects from './Projects.svelte'
 </script>
 
-<div class="flex flex-col">
+<div class="w-screen flex flex-col">
   <WelcomeText />
   <Projects />
 </div>

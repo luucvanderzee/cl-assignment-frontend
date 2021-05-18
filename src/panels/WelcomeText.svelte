@@ -1,6 +1,6 @@
-<div class="w-screen bg-blue-200">
+<div class="w-screen bg-blue-200 text-center">
   <div class="max-w-7xl mx-auto space-y-3 px-2 py-8">
-    <h1 class="text-gray-700 text-2xl font-bold text-center">
+    <h1 class="text-gray-700 text-2xl font-bold">
       Welcome to the participation platform of Labbersville. This site is dedicated to every citizen. 
     </h1>
 

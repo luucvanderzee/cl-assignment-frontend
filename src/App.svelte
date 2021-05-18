@@ -7,7 +7,9 @@
   import MainContent from './panels/MainContent.svelte'
 </script>
 
-<div class="bg-gray-200 h-screen">
+<svelte:body class="overflow-x-hidden" />
+
+<div class="bg-gray-100 antialiased h-full">
   <Header />
   <MainContent />
 </div>
